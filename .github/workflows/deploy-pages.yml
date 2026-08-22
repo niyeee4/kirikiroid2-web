@@ -82,9 +82,12 @@ jobs:
         run: |
           rm -rf /tmp/pages-site && mkdir -p /tmp/pages-site
           cd out/web/release
-          cp index.html index.js index.wasm index.worker.js vlfs.js assets.zip \
+          # index.worker.js is optional: emscripten 4.x embeds the worker
+          # bootstrap inside index.js when it exists at all.
+          cp index.html index.js index.wasm vlfs.js assets.zip \
              manifest.webmanifest sw.js robots.txt sitemap.xml \
              baidu_verify_codeva-3Z4bQwqyXI.html /tmp/pages-site/
+          [ ! -f index.worker.js ] || cp index.worker.js /tmp/pages-site/
           cp -R pwa /tmp/pages-site/pwa
           # GitHub Pages ignores _headers; COOP/COEP is provided at runtime by
           # sw.js (see platforms/web/sw.js withCoiHeaders). Kept for hosts that
