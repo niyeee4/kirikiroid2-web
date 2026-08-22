@@ -1,0 +1,108 @@
+name: Deploy Web to GitHub Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - web
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  EMSDK_VERSION: "4.0.23"
+
+jobs:
+  build-web:
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+      EMSDK: ${{ github.workspace }}/.emsdk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison ninja-build python3 autoconf automake libtool
+
+      - name: Cache Emscripten SDK
+        uses: actions/cache@v4
+        id: emsdk-cache
+        with:
+          path: ${{ env.EMSDK }}
+          key: emsdk-${{ env.EMSDK_VERSION }}-${{ runner.os }}
+
+      - name: Setup Emscripten SDK
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git ${{ env.EMSDK }}
+          ${{ env.EMSDK }}/emsdk install ${{ env.EMSDK_VERSION }}
+          ${{ env.EMSDK }}/emsdk activate ${{ env.EMSDK_VERSION }}
+
+      - name: Activate Emscripten SDK
+        run: |
+          source ${{ env.EMSDK }}/emsdk_env.sh
+          echo "EMSDK=${{ env.EMSDK }}" >> $GITHUB_ENV
+          echo "EM_CONFIG=${{ env.EMSDK }}/.emscripten" >> $GITHUB_ENV
+          echo "${{ env.EMSDK }}" >> $GITHUB_PATH
+          echo "${{ env.EMSDK }}/upstream/emscripten" >> $GITHUB_PATH
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: ${{ env.VCPKG_ROOT }}
+          vcpkgGitCommitId: b1e15efef6758eaa0beb0a8732cfa66f6a68a81d
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.18
+        with:
+          key: ${{ github.job }}
+
+      - name: Configure CMake
+        run: cmake --preset "Web Release Config"
+
+      - name: Pre-build Emscripten ports
+        run: embuilder build sdl2 sdl2_ttf sdl2-mt sdl2_ttf-mt
+
+      - name: Build
+        run: cmake --build out/web/release
+
+      - name: Collect site files
+        run: |
+          rm -rf /tmp/pages-site && mkdir -p /tmp/pages-site
+          cd out/web/release
+          cp index.html index.js index.wasm index.worker.js vlfs.js assets.zip \
+             manifest.webmanifest sw.js robots.txt sitemap.xml \
+             baidu_verify_codeva-3Z4bQwqyXI.html /tmp/pages-site/
+          cp -R pwa /tmp/pages-site/pwa
+          # GitHub Pages ignores _headers; COOP/COEP is provided at runtime by
+          # sw.js (see platforms/web/sw.js withCoiHeaders). Kept for hosts that
+          # honor it (Cloudflare Pages).
+          cp ../../_headers /tmp/pages-site/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: /tmp/pages-site
+
+  deploy:
+    needs: build-web
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
