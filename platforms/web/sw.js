@@ -26,6 +26,41 @@ var RUNTIME_CACHE_ORIGINS = [
     'https://cdn.jsdelivr.net'
 ];
 
+/* --- Cross-origin isolation (COOP/COEP) header injection ---
+ * The engine's pthread pool requires SharedArrayBuffer, which browsers only
+ * enable for cross-origin-isolated documents. Static hosts such as GitHub
+ * Pages cannot set response headers, so the service worker adds them here.
+ * Headers are injected at SERVE time (never baked into cached Responses), so
+ * cache contents stay portable across deployments that set their own headers
+ * (e.g. Cloudflare Pages via _headers). */
+var COI_HEADERS = {
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Embedder-Policy': 'require-corp'
+};
+
+function withCoiHeaders(response) {
+    try {
+        /* Pass through anything that is not a plain successful basic/CORS
+         * response: redirects must keep their semantics, opaque responses
+         * cannot be re-wrapped, and error responses are served as-is. */
+        if (!response || !response.ok) return response;
+        if (response.type !== 'basic' && response.type !== 'cors' &&
+            response.type !== 'default') {
+            return response;
+        }
+        var headers = new Headers(response.headers);
+        for (var name in COI_HEADERS) headers.set(name, COI_HEADERS[name]);
+        return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: headers
+        });
+    } catch (e) {
+        console.warn('[SW] COI header injection failed:', e);
+        return response;
+    }
+}
+
 self.addEventListener('install', function (event) {
     /* NOTE: deliberately NO self.skipWaiting() here.
      * Auto-activating mid-session deletes the old cache while a running page
@@ -72,11 +107,11 @@ self.addEventListener('fetch', function (event) {
             fetch(request).then(function (response) {
                 var clone = response.clone();
                 caches.open(CACHE_NAME).then(function (cache) { cache.put(request, clone); });
-                return response;
+                return withCoiHeaders(response);
             }).catch(function () {
                 return caches.match(request).then(function (cached) {
                     return cached || caches.match('./index.html');
-                });
+                }).then(withCoiHeaders);
             })
         );
         return;
@@ -94,13 +129,13 @@ self.addEventListener('fetch', function (event) {
     if (isSameOrigin || isRuntimeCacheable) {
         event.respondWith(
             caches.match(request).then(function (cached) {
-                if (cached) return cached;
+                if (cached) return withCoiHeaders(cached);
                 return fetch(request).then(function (response) {
                     if (response.ok) {
                         var clone = response.clone();
                         caches.open(CACHE_NAME).then(function (cache) { cache.put(request, clone); });
                     }
-                    return response;
+                    return withCoiHeaders(response);
                 });
             })
         );

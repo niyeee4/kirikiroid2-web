@@ -26,6 +26,16 @@ EM_JS(int, vlfs_js_enabled, (), {
     return (typeof VLFS !== 'undefined' && VLFS._entries) ? 1 : 0;
 });
 
+// Realm detector for the dispatch helpers below. emscripten_is_main_runtime_
+// thread() proved unreliable in this configuration (observed returning 0 on
+// the browser main thread after an Asyncify relink), which permanently latched
+// VLFS::Enabled() to false. What the dispatcher actually needs to know is
+// whether THIS context can reach window.VLFS directly — exactly the condition
+// under which the EM_JS accessors below are safe to call without proxying.
+EM_JS(int, vlfs_js_realm_ok, (), {
+    return (typeof VLFS !== 'undefined') ? 1 : 0;
+});
+
 EM_JS(int, vlfs_js_has, (const char *path), {
     var p = UTF8ToString(path);
     var r = VLFS.has(p);
@@ -209,16 +219,21 @@ EM_JS(void, vlfs_js_ensure_size_proxied, (void *ctx, int fd, double *resPtr), {
 
 namespace {
 
-inline bool OnMain() { return emscripten_is_main_runtime_thread(); }
+// True when this context can call the EM_JS accessors directly (the browser
+// main thread, where window.VLFS lives). Worker threads answer 0 and take the
+// proxy path below.
+inline bool OnMain() { return vlfs_js_realm_ok(); }
 
 inline em_proxying_queue *Queue() { return emscripten_proxy_get_system_queue(); }
 
 inline pthread_t MainThread() { return emscripten_main_runtime_thread_id(); }
 
-// 把任意 lambda 同步代理到主线程执行（worker 阻塞等待）
+// 把任意 lambda 同步代理到主线程执行（worker 阻塞等待）。
+// 返回值：emscripten_proxy_sync 是否真正执行了任务。调度失败（例如运行时
+// 尚未就绪）时必须让调用方知晓——否则默认值会被误当成真实结果缓存。
 template <typename F>
-void RunOnMainSync(F &&fn) {
-    emscripten_proxy_sync(
+bool RunOnMainSync(F &&fn) {
+    return emscripten_proxy_sync(
         Queue(), MainThread(),
         [](void *arg) { (*static_cast<F *>(arg))(); }, &fn);
 }
@@ -283,23 +298,36 @@ vlfs_async_read_main_finish(void *arg, int result) {
 
 namespace VLFS {
 
+namespace {
+
+// Latch is ONLY written on the main runtime thread. A negative result captured
+// on a worker can come from an unserviced proxy (emscripten_proxy_sync fails
+// while the runtime is still booting) rather than a truthful answer; caching
+// it permanently disabled every VLFS entry point for the whole session.
+bool EnabledOnMain() {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = vlfs_js_enabled();
+        EM_ASM({ console.warn('[vlfs] VirtualLazyFS enabled=', $0); },
+               cached);
+    }
+    return cached != 0;
+}
+
+} // namespace
+
 bool Enabled() {
 #ifdef KRKR2_WASMTIME_HEADLESS
     // Wasmtime 差分 guest 无浏览器宿主，主线程代理队列也无人消费，
     // RunOnMainSync 探测会 futex abort——编译期恒禁用，走 MEMFS 路径。
     return false;
 #else
-    static int cached = -1;
-    if (cached < 0) {
-        int v = 0;
-        if (OnMain()) {
-            v = vlfs_js_enabled();
-        } else {
-            RunOnMainSync([&] { v = vlfs_js_enabled(); });
-        }
-        cached = v;
-    }
-    return cached != 0;
+    if (OnMain()) return EnabledOnMain();
+    int v = 0;
+    // Unserviced proxy（运行时尚未就绪）只影响本次调用，不写缓存。
+    if (!RunOnMainSync([&] { v = EnabledOnMain() ? 1 : 0; }))
+        return false;
+    return v != 0;
 #endif
 }
 

@@ -16,6 +16,59 @@
     <meta name="twitter:description" content="Run Kirikiri2 visual novels directly in your browser. Load .xp3 game files, no installation required.">
     <title>Kirikiroid2 Web — Browser-based Kirikiri2 Visual Novel Engine</title>
     <meta name="theme-color" content="#1a1a2e">
+    <script>
+        // --- Cross-origin isolation bootstrap (GitHub Pages / static hosts) ---
+        // The engine's pthread pool requires SharedArrayBuffer, and browsers
+        // only enable SAB in a cross-origin-isolated context (COOP: same-origin
+        // + COEP: require-corp on the DOCUMENT response). Static hosts like
+        // GitHub Pages cannot set response headers; a service worker can.
+        // sw.js injects both headers on every response it serves.
+        //
+        // Flow on the very first visit: no SW is controlling yet, so the page
+        // is not isolated -> register sw.js immediately (before any heavy
+        // work), then reload once so the navigation response gains the
+        // isolation headers. sessionStorage guards against reload loops when
+        // a browser refuses to honor worker-provided headers.
+        (function() {
+            try {
+                if (window.crossOriginIsolated) {
+                    sessionStorage.removeItem('krkr2-coi-reload');
+                    return;
+                }
+                var params = new URLSearchParams(window.location.search);
+                if (params.has('no-coi')) return;
+                if (!('serviceWorker' in navigator)) return;
+                if (location.protocol !== 'https:' &&
+                    location.protocol !== 'http:') return;
+                if (sessionStorage.getItem('krkr2-coi-reload')) {
+                    console.warn('[coi] reload already attempted this session; continuing unisolated');
+                    return;
+                }
+                sessionStorage.setItem('krkr2-coi-reload', '1');
+                window.__krkr2CoiReloading = true;
+                navigator.serviceWorker.register('./sw.js', { scope: './' })
+                    .then(function() {
+                        // Wait for the registration to become controlling so
+                        // the reload lands in an isolated context.
+                        if (navigator.serviceWorker.controller) return null;
+                        return new Promise(function(resolve) {
+                            navigator.serviceWorker.addEventListener(
+                                'controllerchange', function onChange() {
+                                    navigator.serviceWorker.removeEventListener(
+                                        'controllerchange', onChange);
+                                    resolve();
+                                });
+                            // Fallback resolve if activation stalls.
+                            setTimeout(resolve, 3000);
+                        });
+                    })
+                    .catch(function(err) {
+                        console.warn('[coi] service worker registration failed:', err);
+                    })
+                    .then(function() { window.location.reload(); });
+            } catch (e) {}
+        })();
+    </script>
     <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -918,42 +971,77 @@
             forceUpdate();
         });
 
-        // --- JSPI 能力检测：主线程文件读依赖 WebAssembly JSPI（VirtualLazyFS），
-        // 缺失时引擎会死在 glue 的 "JSPI not supported" 断言上，用户只能看到
-        // 天书。这里提前检测并按浏览器给出明确的升级/换浏览器指引。---
-        var jspiUnsupported = !(typeof WebAssembly !== 'undefined' &&
-            typeof WebAssembly.Suspending === 'function' &&
-            typeof WebAssembly.promising === 'function');
-        if (jspiUnsupported) {
+        // --- Capability gate (feature detection, never UA-based blocking) ---
+        // The shipped build suspends main-thread file reads via Binaryen
+        // Asyncify, which is plain transformed WASM: every WASM-capable
+        // browser supports it, including iOS Safari 18/19/26 and older
+        // Chromium/Firefox. JSPI (WebAssembly.Suspending/promising) is NOT a
+        // dependency — do not gate on it.
+        //
+        // What IS genuinely required:
+        //   1. WebAssembly itself,
+        //   2. WebGL (renderer),
+        //   3. SharedArrayBuffer + cross-origin isolation (pthread pool).
+        // Only show "Browser Not Supported" when one of those is missing.
+        var capabilityBlocked = (function () {
+            var problems = [];
+            var hasWasm = typeof WebAssembly !== 'undefined' &&
+                typeof WebAssembly.instantiate === 'function' &&
+                typeof WebAssembly.Memory === 'function';
+            if (!hasWasm) {
+                problems.push({
+                    id: 'wasm',
+                    text: 'Trình duyệt thiếu hỗ trợ WebAssembly.\n' +
+                          'This browser does not support WebAssembly.'
+                });
+            }
+            var hasWebGL = (function () {
+                try {
+                    var c = document.createElement('canvas');
+                    return !!(c.getContext('webgl') ||
+                              c.getContext('experimental-webgl'));
+                } catch (e) { return false; }
+            })();
+            if (!hasWebGL) {
+                problems.push({
+                    id: 'webgl',
+                    text: 'Trình duyệt thiếu hỗ trợ WebGL (bắt buộc cho renderer).\n' +
+                          'This browser lacks WebGL support, which the renderer requires.'
+                });
+            }
+            var hasSab = typeof SharedArrayBuffer === 'function';
+            var isolated = !!window.crossOriginIsolated;
+            if (!hasSab || !isolated) {
+                problems.push({
+                    id: 'coi',
+                    text: 'Engine cần chạy đa luồng (SharedArrayBuffer), trang web phải ' +
+                          'được phục vụ trong chế độ cross-origin isolated (COOP/COEP).\n' +
+                          'Nếu bạn tự host bản build này, hãy thêm header ' +
+                          '"Cross-Origin-Opener-Policy: same-origin" và ' +
+                          '"Cross-Origin-Embedder-Policy: require-corp".\n\n' +
+                          'The engine\'s thread pool requires SharedArrayBuffer, which needs a ' +
+                          'cross-origin-isolated context (COOP/COEP response headers). ' +
+                          'When self-hosting, add "Cross-Origin-Opener-Policy: same-origin" and ' +
+                          '"Cross-Origin-Embedder-Policy: require-corp" to your server. ' +
+                          'On GitHub Pages this site installs a service worker automatically; ' +
+                          'try a hard refresh once more.'
+                });
+            }
+            console.log('[cap] WebAssembly=' + hasWasm + ' WebGL=' + hasWebGL +
+                        ' SAB=' + hasSab + ' crossOriginIsolated=' + isolated +
+                        ' JSPI=' + (typeof WebAssembly !== 'undefined' &&
+                                    typeof WebAssembly.Suspending === 'function'));
+            if (!problems.length) return false;
             (function () {
-                var ua = navigator.userAgent;
-                // iOS 上所有浏览器（含 Chrome 的 CriOS / Firefox 的 FxiOS）都被
-                // 强制使用 WebKit 内核，一律按 Safari 处理；iPadOS 13+ 默认伪装
-                // 桌面 Mac UA，用触点数辨别
-                var isIOS = /iPhone|iPad|iPod/.test(ua) ||
-                    (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
-                var isFirefox = /Firefox\//.test(ua);
-                var isChromium = /Chrome\/|Chromium\/|Edg\/|OPR\//.test(ua);
-                var isSafari = /Safari\//.test(ua) && !isChromium && !isFirefox;
-                var advice;
-                if (isIOS || isSafari) {
-                    advice = '请升级到 Safari 27（iOS 27）或以上版本。\nPlease upgrade to Safari 27 (iOS 27) or later.';
-                } else if (isFirefox) {
-                    advice = '请改用最新版 Chrome 浏览器。\nPlease use the latest version of Google Chrome instead.';
-                } else if (isChromium) {
-                    advice = '请将浏览器升级到最新版本（需要 Chrome 137 或以上）。\nPlease update your browser to the latest version (Chrome 137 or later).';
-                } else {
-                    advice = '请使用最新版 Chrome 浏览器。\nPlease use the latest version of Google Chrome.';
-                }
+                var detail = problems.map(function (p) { return p.text; }).join('\n\n');
                 document.querySelector('#error-box h2').textContent = 'Browser Not Supported';
-                document.getElementById('error-message').textContent =
-                    '当前浏览器缺少引擎所需的 WebAssembly JSPI 能力。\n' +
-                    'This browser lacks WebAssembly JSPI, which the engine requires.\n\n' + advice;
-                // 强制更新解决不了能力缺失，隐藏避免误导
+                document.getElementById('error-message').textContent = detail;
+                // Force-update cannot add missing capabilities; hide it to avoid confusion.
                 document.getElementById('error-update-btn').style.display = 'none';
                 document.getElementById('error-overlay').classList.add('visible');
             })();
-        }
+            return true;
+        })();
 
         // --- File System Access API state ---
         var hostDirHandle = null;
@@ -1045,16 +1133,25 @@
         // V8 对 maximum 只做惰性虚拟地址预留，而 JSC（尤其 iOS）按 maximum 实预留，
         // iPhone 的 WebContent 进程拿不到 2GB，直接 RangeError: Out of memory，
         // 引擎死在启动前。glue 优先采用 Module.wasmMemory（initMemory 第一分支），
-        // 这里逐级降档预创建：桌面第一档 2048MB 即成功（行为与原来完全一致），
-        // iOS 自动落到能分配的档位。提供的 maximum ≤ 模块声明的 2GB 可通过导入校验。
+        // 这里逐级降档预创建：桌面第一档 2048MB 即成功（行为与原来完全一致）。
+        //
+        // iOS/iPadOS（含伪装成 Mac 的 iPadOS 13+，用触点数辨别）从更低的档位起步：
+        // WebKit 对共享 Memory 按 maximum 提前预留/加压，过大的 maximum 即使分配
+        // 成功也会在后续增长时被 jetsam 杀掉（表现为 "A problem repeatedly
+        // occurred"）。档位上限即引擎可增长到的上限；视觉小说类游戏的实际峰值
+        // 通常远低于此，ALLOW_MEMORY_GROWTH 按需扩页。
         var preallocWasmMemory = null;
         (function () {
+            if (window.__krkr2CoiReloading) return; // COI bootstrap 即将刷新页面
             // 由 CMake 经 configure_file @ONLY 注入，与链接参数 -s INITIAL_MEMORY
             // 同源（KRKR2_WEB_INITIAL_MEMORY）。ASan 构建需 1GB（影子内存把 wasm
             // 声明的 min 顶高），非 ASan 64MB。预分配的 initial 必须 >= wasm 声明
             // 的 min，否则 glue 采用本 Memory 时导入校验失败 → LinkError。
             var INITIAL_PAGES = @KRKR2_WEB_INITIAL_MEMORY@ / 65536;
-            var ladder = [2048, 1536, 1024, 768];  // MB
+            var isIOSLike = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+                (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+            var ladder = isIOSLike ? [1024, 768, 512]   // MB — iOS jetsam-safe tiers
+                                   : [2048, 1536, 1024, 768];
             for (var i = 0; i < ladder.length; i++) {
                 try {
                     preallocWasmMemory = new WebAssembly.Memory({
@@ -1062,11 +1159,12 @@
                         maximum: ladder[i] * 16,   // 1MB = 16 个 64KB 页
                         shared: true
                     });
-                    if (i > 0) console.warn('[mem] shared memory maximum 降档至 ' + ladder[i] + 'MB（首选 2048MB 分配失败）');
+                    if (i > 0) console.warn('[mem] shared memory maximum 降档至 ' + ladder[i] + 'MB（首选 ' + ladder[0] + 'MB 分配失败）');
+                    else if (isIOSLike) console.log('[mem] shared memory maximum ' + ladder[i] + 'MB (iOS tier)');
                     break;
                 } catch (e) { /* 尝试下一档 */ }
             }
-            if (!preallocWasmMemory && !jspiUnsupported) {
+            if (!preallocWasmMemory && !capabilityBlocked) {
                 document.querySelector('#error-box h2').textContent = 'Out of Memory';
                 document.getElementById('error-message').textContent =
                     '无法分配引擎所需的共享内存，请关闭其他标签页/应用后刷新重试。\n' +
@@ -1128,8 +1226,8 @@
                 }
             },
             onAbort: function(what) {
-                // JSPI 缺失的指引浮层已在显示，引擎随后的断言 abort 不要覆盖它
-                if (jspiUnsupported) return;
+                // Capability-gate overlay đã hiển thị thì đừng đè lên bằng abort message
+                if (capabilityBlocked) return;
                 document.getElementById('error-message').textContent =
                     'The application has aborted. ' + what;
                 document.getElementById('error-overlay').classList.add('visible');

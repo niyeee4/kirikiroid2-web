@@ -41,6 +41,22 @@ option(ENABLE_TESTS "enable tests execute build(exclude android)" ON)
 option(BUILD_TOOLS "build tools execute build(exclude android ios)" ON)
 option(KRKR2_WEB_DEBUG_ENABLE_ASAN "enable AddressSanitizer in Web Debug builds" ON)
 option(KRKR2_WEB_ENABLE_SOURCE_MAP "emit a WebAssembly source map for Web builds" OFF)
+# Suspension backend for main-thread VirtualLazyFS reads.
+#   asyncify (default): Binaryen Asyncify transform. Works in every
+#     WASM-capable browser (iOS Safari 18+, Firefox, Chromium of any age);
+#     JSPI is not required at runtime. Uses emscripten legacy exception
+#     handling because -fwasm-exceptions cannot mix with ASYNCIFY=1
+#     (verified with emcc 4.0.23: "ASYNCIFY=1 is not compatible with
+#     -fwasm-exceptions").
+#   jspi: original WebAssembly JSPI build (Chromium 137+ / WebKit 26.4+
+#     only). Kept selectable for modern-only deployments and A/B testing;
+#     must never be shipped as the sole artifact if iOS 18-26 support matters.
+set(KRKR2_WEB_ASYNC_MODE "asyncify" CACHE STRING
+    "Web suspension backend: asyncify (universal, no JSPI required) or jspi")
+string(TOUPPER "${KRKR2_WEB_ASYNC_MODE}" KRKR2_WEB_ASYNC_MODE_UPPER)
+if(NOT KRKR2_WEB_ASYNC_MODE_UPPER MATCHES "^(ASYNCIFY|JSPI)$")
+    message(FATAL_ERROR "KRKR2_WEB_ASYNC_MODE must be 'asyncify' or 'jspi', got '${KRKR2_WEB_ASYNC_MODE}'")
+endif()
 option(KRKR2_ENABLE_WASMTIME_HEADLESS "build the generic Wasmtime headless debug runner" OFF)
 if(NOT DEFINED KRKR2_USE_STUB_SPDLOG)
     set(_KRKR2_USE_STUB_SPDLOG_DEFAULT OFF)
@@ -71,13 +87,27 @@ if(MSVC)
     add_link_options("/ignore:4099" "/INCREMENTAL" "/DEBUG:FASTLINK")
     # set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 elseif(WEB)
-    add_compile_options(
-        -pthread
-        -fwasm-exceptions
-        -msimd128
-        $<$<AND:$<CONFIG:Debug>,$<BOOL:${KRKR2_WEB_DEBUG_ENABLE_ASAN}>>:-fsanitize=address>
-        $<$<BOOL:${KRKR2_WEB_ENABLE_SOURCE_MAP}>:-gline-tables-only>
-    )
+    if(KRKR2_WEB_ASYNC_MODE_UPPER STREQUAL "JSPI")
+        add_compile_options(
+            -pthread
+            -fwasm-exceptions
+            -msimd128
+            $<$<AND:$<CONFIG:Debug>,$<BOOL:${KRKR2_WEB_DEBUG_ENABLE_ASAN}>>:-fsanitize=address>
+            $<$<BOOL:${KRKR2_WEB_ENABLE_SOURCE_MAP}>:-gline-tables-only>
+        )
+    else()
+        # Asyncify mode: emscripten legacy exception handling. -fexceptions
+        # enables the invoke_/landingpad codegen; -sDISABLE_EXCEPTION_CATCHING=0
+        # (link step below) keeps catching enabled. Native wasm exceptions
+        # (-fwasm-exceptions) are NOT an option here: ASYNCIFY=1 rejects them.
+        add_compile_options(
+            -pthread
+            -fexceptions
+            -msimd128
+            $<$<AND:$<CONFIG:Debug>,$<BOOL:${KRKR2_WEB_DEBUG_ENABLE_ASAN}>>:-fsanitize=address>
+            $<$<BOOL:${KRKR2_WEB_ENABLE_SOURCE_MAP}>:-gline-tables-only>
+        )
+    endif()
     add_link_options($<$<AND:$<CONFIG:Debug>,$<BOOL:${KRKR2_WEB_DEBUG_ENABLE_ASAN}>>:-fsanitize=address>)
 endif()
 
@@ -88,8 +118,16 @@ if(ANDROID)
 elseif(WEB)
     add_executable(${PROJECT_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/main.cpp)
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "index" SUFFIX ".html")
+    if(KRKR2_WEB_ASYNC_MODE_UPPER STREQUAL "JSPI")
+        set(KRKR2_WEB_MAINLOOP_JS_LIBRARY
+            ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/mainloop_jspi_fix.js)
+    else()
+        set(KRKR2_WEB_MAINLOOP_JS_LIBRARY
+            ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/mainloop_asyncify.js)
+    endif()
     set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/jspi_jsc_mainloop_fix.js
+        ${KRKR2_WEB_MAINLOOP_JS_LIBRARY}
+        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/web_audio_resume.js
         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/vlfs.js)
     # WebAssembly.Memory 初始大小。ASan 的影子内存（覆盖整个地址空间的 1/8）+
     # redzone 把静态数据段顶得很高，wasm 模块声明的最小内存随之暴涨（非 ASan ~64MB，
@@ -113,6 +151,33 @@ elseif(WEB)
     # 变量便于诊断更大游戏的并发上限，而不是让 Release 使用不同的生命周期语义。
     set(KRKR2_WEB_PTHREAD_POOL_SIZE "64" CACHE STRING
         "Pre-created Emscripten pthread workers (must cover peak live threads)")
+    # --- Suspension backend (main-thread VirtualLazyFS reads) ---
+    # asyncify: Binaryen Asyncify transform. EM_ASYNC_JS imports compile under
+    # both backends, so VirtualLazyFS.cpp needs no source changes.
+    # ASYNCIFY_STACK_SIZE is the linear-memory buffer holding the unwound C
+    # stack across a suspension; 1 MiB covers deep TJS/XP3 call chains and is
+    # a one-time per-thread allocation (only the main thread ever suspends;
+    # workers block on Atomics via the proxy path instead). Nothing here can
+    # ever request gigabyte-scale memory: the buffer lives inside the normal
+    # heap, not above it.
+    # jspi: 主线程文件读经 JSPI 挂起等待 JS 异步供数（Chromium 137+ /
+    # WebKit 26.4+，即 Safari 27 beta；EM_ASYNC_JS 导入自动包
+    # WebAssembly.Suspending）。krkr2_main_loop_tick 是唯一可挂起的 wasm 入口
+    # （cocos 主循环 tick，见 vcpkg cocos2dx patch CCApplication-emscripten.cpp）：
+    # glue 的 getWasmTableEntry 会给"同时是 JSPI_EXPORTS 导出"的函数指针表项包
+    # WebAssembly.promising。该识别靠函数对象身份比较，JSC 不满足 table.get/export
+    # 身份等价，需用户库覆盖 set_main_loop_arg 兜底，见 mainloop_jspi_fix.js。
+    if(KRKR2_WEB_ASYNC_MODE_UPPER STREQUAL "JSPI")
+        set(KRKR2_WEB_SUSPENSION_LINK_FLAGS
+            "SHELL:-s JSPI=1"
+            "SHELL:-s JSPI_EXPORTS=['krkr2_main_loop_tick']"
+            -fwasm-exceptions)
+    else()
+        set(KRKR2_WEB_SUSPENSION_LINK_FLAGS
+            "SHELL:-s ASYNCIFY=1"
+            "SHELL:-s ASYNCIFY_STACK_SIZE=1048576"
+            "-sDISABLE_EXCEPTION_CATCHING=0")
+    endif()
     target_link_options(${PROJECT_NAME} PRIVATE
         "SHELL:-s USE_SDL=2"
         "SHELL:-s USE_SDL_TTF=2"
@@ -126,22 +191,18 @@ elseif(WEB)
         "$<$<NOT:$<CONFIG:Debug>>:SHELL:-s STACK_OVERFLOW_CHECK=0>"
         "$<$<CONFIG:Debug>:SHELL:-s ASSERTIONS=2>"
         "SHELL:-s FORCE_FILESYSTEM=1"
-        "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
+        # krkr2_vlfs_read_all/exists: VirtualLazyFS bridges (also used by the
+        # browser-side asyncify suspension probe); HEAPU8 + malloc/free for
+        # ccall users and byte-level verification from test harnesses.
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAPU8','stringToUTF8','lengthBytesUTF8']"
+        "SHELL:-s EXPORTED_FUNCTIONS=['_krkr2_vlfs_read_all','_krkr2_vlfs_exists','_malloc','_free']"
         "SHELL:-s PTHREAD_POOL_SIZE=${KRKR2_WEB_PTHREAD_POOL_SIZE}"
         "SHELL:-s DEFAULT_PTHREAD_STACK_SIZE=1048576"
-        # VirtualLazyFS: 主线程文件读经 JSPI 挂起等待 JS 异步供数
-        # （Chromium 137+ / WebKit 26.4+，即 Safari 27 beta；EM_ASYNC_JS 导入
-        # 自动包 WebAssembly.Suspending）。
-        # krkr2_main_loop_tick 是唯一可挂起的 wasm 入口（cocos 主循环 tick，
-        # 见 vcpkg cocos2dx patch CCApplication-emscripten.cpp）：glue 的
-        # getWasmTableEntry 会给"同时是 JSPI_EXPORTS 导出"的函数指针表项
-        # 包 WebAssembly.promising。该识别靠函数对象身份比较，JSC 不满足
-        # table.get/export 身份等价，需用户库覆盖 set_main_loop_arg 兜底，
-        # 见 jspi_jsc_mainloop_fix.js。
-        "SHELL:-s JSPI=1"
-        "SHELL:-s JSPI_EXPORTS=['krkr2_main_loop_tick']"
-        "SHELL:--js-library ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/jspi_jsc_mainloop_fix.js"
-        -fwasm-exceptions
+        ${KRKR2_WEB_SUSPENSION_LINK_FLAGS}
+        # Frame-pump override (FPS throttle; JSC main-loop wrap in JSPI mode)
+        # and the WebAudio gesture bridge are shared user libraries.
+        "SHELL:--js-library ${KRKR2_WEB_MAINLOOP_JS_LIBRARY}"
+        "SHELL:--js-library ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/web_audio_resume.js"
         $<$<BOOL:${KRKR2_WEB_ENABLE_SOURCE_MAP}>:-gsource-map>
         $<$<CONFIG:Debug>:--emit-symbol-map>
         $<$<CONFIG:Debug>:-g2>
@@ -171,7 +232,13 @@ elseif(WEB)
     )
     add_custom_target(krkr2_web_assets ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/assets.zip)
     add_dependencies(${PROJECT_NAME} krkr2_web_assets)
-    target_compile_options(${PROJECT_NAME} PRIVATE "SHELL:-s USE_SDL=2" "SHELL:-s USE_SDL_TTF=2" -fwasm-exceptions)
+    if(KRKR2_WEB_ASYNC_MODE_UPPER STREQUAL "JSPI")
+        target_compile_options(${PROJECT_NAME} PRIVATE
+            "SHELL:-s USE_SDL=2" "SHELL:-s USE_SDL_TTF=2" -fwasm-exceptions)
+    else()
+        target_compile_options(${PROJECT_NAME} PRIVATE
+            "SHELL:-s USE_SDL=2" "SHELL:-s USE_SDL_TTF=2" -fexceptions)
+    endif()
     # Local ZIP opener is visible by default in Debug, and can be enabled
     # explicitly in Release with ?pickZip=1.
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")

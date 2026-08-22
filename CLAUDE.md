@@ -34,7 +34,7 @@
 - `cpp/core/plugin/PluginImpl.cpp` — TVPLoadPlugin（由 Plugins.link 调用）、TVPLoadInternalPlugins（启动时）
 - `cpp/core/base/StorageIntf.cpp` — 自动路径表、TVPAddAutoPath、TVPGetPlacedPath
 - `cpp/core/environ/web/Platform.cpp` — Web 平台启动逻辑
-- `cpp/core/environ/web/VirtualLazyFS.{h,cpp}` + `platforms/web/vlfs.js` — VirtualLazyFS：游戏/UI 文件懒加载（JSPI 挂起读 + pthread 代理 + OPFS spill + 写 overlay），仅 Chromium 137+
+- `cpp/core/environ/web/VirtualLazyFS.{h,cpp}` + `platforms/web/vlfs.js` — VirtualLazyFS：游戏/UI 文件懒加载（主线程挂起读 + pthread 代理 + OPFS spill + 写 overlay）。挂起后端由 `KRKR2_WEB_ASYNC_MODE` 决定：默认 `asyncify`（全浏览器兼容，iOS Safari 18+ 可跑），可选 `jspi`（仅 Chromium 137+ / WebKit 26.4+）
 - `tests/unit-tests/plugins/motionplayer-dll.cpp` — MotionPlayer/EmotePlayer 单元测试
 
 ## 代码模式
